@@ -1,36 +1,27 @@
 import os
 import re
-
-import numpy as np
-import keras
-
-from keras.preprocessing.image import img_to_array, load_img
-from keras.applications.resnet50 import preprocess_input, decode_predictions
-
-from aiogram import Bot, Dispatcher, executor, types
-import aiohttp
+import requests
 import logging
 
+from PIL import Image
+import aiohttp
+import asyncio
+from aiogram import Bot, Dispatcher, executor, types
 
-TOKEN = os.getenv('TELEGRAM_API_TOKEN_WHATABOT')
+from image_proccessing import img_preproccessing
+from image_proccessing import photos_in_frame
+from model_functions import prediction_classifier
+from model_functions import prediction_decoder
+from model_functions import reply_markup_compiler
+from detection import car_inspector
+from car_classes import car_description
 
-model = keras.applications.Xception(
-    include_top=True,
-    weights="imagenet",
-    input_tensor=None,
-    input_shape=None,
-    pooling=None,
-    classes=1000,
-    classifier_activation="softmax",
-)
+# Static text of ignoring not target user message types
+from text_templates import NOT_TARGET_CONTENT_TYPES, HELLO_TEXT, WAITING_TEXT
+from text_templates import NOT_TARGET_TEXT, ERROR_NOT_CAR, ERROR_LITTLE_CAR, HINT_TEXT
 
-model.summary()
-
-model.compile(
-    optimizer=keras.optimizers.Adam(1e-5),  # Low learning rate
-    loss=keras.losses.BinaryCrossentropy(from_logits=True),
-    metrics=[keras.metrics.BinaryAccuracy()],
-)
+# Make sure that u got telegram api token from @BotFather
+TOKEN = os.getenv('TELEGRAM_API_TOKEN_CARBOT')
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -39,43 +30,130 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
-@dp.message_handler(commands=['start', 'help'])
+# Base command messages for start and exceptions (not target content inputs)
+@dp.message_handler(commands=['start'])
 async def send_welcome(message: types.Message):
-    _user_name = message.from_user.first_name
-    _text = "Хэлло, бой! Твоё имя - %s!\nА меня ты можешь называть: What_is_this_bot?!" %_user_name
-    await message.reply(_text)
+    user_name = message.from_user.first_name
+    user_id = message.from_user.id
+    text = HELLO_TEXT %user_name
+    logging.info(f'first start from user_name = {user_name}, user_id = {user_id}')
+    await message.reply(text)
 
-@dp.message_handler(content_types=['text'])
+@dp.message_handler(content_types=NOT_TARGET_CONTENT_TYPES)
 async def handle_docs_photo(message):
-    _user_name = message.from_user.first_name
-    _text = "Смотри, %s! Ты отправляешь фотографию, а я говорю тебе: 'what is this' and % of prediction score" %_user_name
+    user_name = message.from_user.first_name
+    text = NOT_TARGET_TEXT %user_name
+    await message.reply(text)
 
-    await bot.send_message(message.chat.id, _text)
 
-
+# Main functions of this bot with target content type of message
 @dp.message_handler(content_types=['photo'])
-async def handle_docs_photo(message):
-    _user_name = message.from_user.first_name
-    _user_id = message.from_user.id
-    _text = "Спасибо, %s! Подожди секунду..." %_user_name
-    _photo_name = './photos/carphoto_%s.jpg' %_user_id
-    await message.photo[-1].download(_photo_name),
-    await bot.send_message(message.chat.id, _text)
-    _img_path = _photo_name
-    _img = load_img(_img_path, target_size=(299, 299))  # this is a PIL image
-    _img_arr = img_to_array(_img)  # Numpy array with shape (299, 299, 3)
-    _img_arr = _img_arr.reshape((1,) + x.shape)  # Numpy array with shape (1, 299, 299, 3)
-    # Rescale by 1/255
-    _img_arr /= 255
+async def handle_photo_for_prediction(message):
+    chat_id = message.chat.id
 
-    _preds = model.predict(_img_arr)
-    _pred_decoded = decode_predictions(preds)[0][0:3]
-    _pred_decoded = [el[1:] for el in _pred_decoded]
-    _test_text_of_prediction = ' '.join([str(elem) for elem in _pred_decoded])
-    _test_text_of_prediction = re.sub("[,']", "", _test_text_of_prediction)
-    _test_text_of_prediction = re.sub("[()]", "\n", _test_text_of_prediction)
+    # Check for 'single photo - single message'
+    # None media_group_id - means single photo at message
+    if message.media_group_id is None:
+        ### Get user's variables
+        user_name = message.from_user.first_name
+        user_id = message.from_user.id
+        message_id = message.message_id
 
-    await bot.send_message(message.chat.id, _test_text_of_prediction)
+        text = WAITING_TEXT %user_name
+        logging.info(f'{user_name, user_id} is knocking to our bot')
+        await bot.send_message(chat_id, text)
+
+        # Define input photo local path
+        photo_name = './input/carphoto_%s_%s.jpg' %(user_id, message_id)
+        await message.photo[-1].download(photo_name) # extract photo for further procceses
+
+        ### Detection of car on photo with Detectron2
+
+        # Output photo local path
+        detection_photo_name = './output/detection/photo_%s_%s.jpg' %(user_id, message_id)
+        # Set output path for internal use
+        cropped_photo_name = './output/detection/detected_car_photo_%s_%s.jpg' %(user_id, message_id)
+        # Detector predictions
+        num_cars, little_car = car_inspector(photo_name, detection_photo_name, cropped_photo_name)
+
+        # Find proper car bounding box for futher manipulations
+        if num_cars == 0:
+            # It means - no proper car on the photos
+            # Error message for notcar input photo
+            logging.info(f'call "car_inspection_results" = {num_cars} - it means: no car here!')
+            await message.reply(ERROR_NOT_CAR)
+            await bot.send_photo(chat_id, photo=open(detection_photo_name, 'rb'))
+
+        else:
+            # Car inspector found the car!
+
+            # Check for proper size car on the photo
+            if little_car == True:
+                await message.reply(ERROR_LITTLE_CAR)
+                await bot.send_photo(chat_id, photo=open(detection_photo_name, 'rb'))
+
+            else:
+                # We found the for proper size car on the photo
+                await message.reply('Смотри-ка! Мы нашли её!')
+                await bot.send_photo(chat_id, photo=open(detection_photo_name, 'rb'))
+                await bot.send_photo(chat_id, photo=open(cropped_photo_name, 'rb'))
+
+                ### Main car classifier prediction below
+                img_array = img_preproccessing(cropped_photo_name)
+                preds = prediction_classifier(img_array) # raw predictions from keras model
+
+                # Massive prediction extraction
+                decoded_result, index_top_pred = prediction_decoder(preds) # and decode to text form
+
+                # Inline keyboard compilation
+                keyboard = reply_markup_compiler(*decoded_result)
+
+                # Output prediction collage parameters
+                car_classes_path = './output_car_classes'
+                height = 300
+                width = 400
+                frame_width = 10
+
+                # Take preds index for top-4 for collage generation
+                index1 = str(index_top_pred[3])+'.jpg'
+                index2 = str(index_top_pred[2])+'.jpg'
+                index3 = str(index_top_pred[1])+'.jpg'
+                index4 = str(index_top_pred[0])+'.jpg'
+
+                # Make collage image
+                pred_img = photos_in_frame(height, width, frame_width,
+                                           car_classes_path,
+                                           index1, index2, index3, index4)
+
+                pred_collage_path = './output/output_%s_%s.jpg' %(user_id, message_id)
+                pred_img.save(pred_collage_path)
+
+                # Little pause before send prediction message (in seconds)
+                await asyncio.sleep(3)
+
+                # Resulting massage of prediction
+                await bot.send_photo(chat_id,
+                                     photo=open(pred_collage_path, 'rb'),
+                                     caption=HINT_TEXT,
+                                     reply_markup=keyboard)
+
+                # Inline buttons callback query handlers
+                @dp.callback_query_handler(lambda callback_query: True)
+                async def callback_handler(call: types.CallbackQuery):
+                    # Set time in seconds that callback query results may be cached by client-side
+                    await call.answer(cache_time=60)
+                    callback_data = call.data
+                    logging.info(f'call = {user_name, user_id, message_id, callback_data}')
+                    # Make car description for inline buttons response
+                    # by car dictionary decoder and resulting text generator
+                    description = car_description(callback_data)
+                    await call.message.answer(description, disable_web_page_preview=True)
+
+    else:
+        # If more than one photo in  message
+        await message.reply("Пожалуйста, пришли одну фотографию, а не вот столько!")
+
+
 
 if __name__ == '__main__':
     executor.start_polling(dp, skip_updates=True)
